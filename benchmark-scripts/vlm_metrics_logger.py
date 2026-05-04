@@ -107,6 +107,24 @@ class VLMMetricsLogger:
         self.logger.info(message)
         return timestamp_ms
     
+    def user_log_start_time(self, timestamp_milliseconds, usecase_name=None, unique_id='retail-default'):
+        
+        timestamp_ms = int(timestamp_milliseconds)
+        
+        log_data = {
+            'application': os.getenv(usecase_name),
+            'id': unique_id,
+            'event': 'start',
+            'timestamp_ms': timestamp_ms
+        }
+        
+        # Format log message
+        message_parts = [f"{key}={value}" for key, value in log_data.items()]
+        message = " ".join(message_parts)
+        
+        self.logger.info(message)
+        return timestamp_ms
+        
     def log_end_time(self, usecase_name, unique_id='retail-default'):
         
         timestamp_ms = int(time.time() * 1000)
@@ -125,6 +143,24 @@ class VLMMetricsLogger:
         self.logger.info(message)
         return timestamp_ms
     
+    def user_log_end_time(self, timestamp_milliseconds, usecase_name, unique_id='retail-default'):
+        
+        timestamp_ms = int(timestamp_milliseconds)
+        
+        log_data = {
+            'application': os.getenv(usecase_name),
+            'id': unique_id,
+            'event': 'end',
+            'timestamp_ms': timestamp_ms
+        }
+            
+        # Format log message
+        message_parts = [f"{key}={value}" for key, value in log_data.items()]
+        message = " ".join(message_parts)
+        
+        self.logger.info(message)
+        return timestamp_ms
+        
     def log_custom_event(self, event_type, usecase_name, unique_id='retail-default', **kwargs):
         timestamp_ms = int(time.time() * 1000)
         
@@ -219,6 +255,14 @@ def log_end_time(application_name, unique_id='retail-default'):
     """Convenience function for logging end time"""
     return get_logger().log_end_time(application_name, unique_id=unique_id)
 
+def user_log_start_time(timestamp_milliseconds, application_name, unique_id='retail-default'):
+    """Convenience function for logging start time"""
+    return get_logger().log_start_time(timestamp_milliseconds, application_name, unique_id=unique_id)
+
+def user_log_end_time(timestamp_milliseconds, application_name, unique_id='retail-default'):
+    """Convenience function for logging end time"""
+    return get_logger().log_end_time(timestamp_milliseconds, application_name, unique_id=unique_id)
+    
 def log_custom_event(event_type, application_name, unique_id='retail-default', **kwargs):
     """Convenience function for logging custom events"""
     return get_logger().log_custom_event(event_type, application_name, **kwargs)
