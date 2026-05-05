@@ -257,11 +257,11 @@ def log_end_time(application_name, unique_id='retail-default'):
 
 def user_log_start_time(timestamp_milliseconds, application_name, unique_id='retail-default'):
     """Convenience function for logging start time"""
-    return get_logger().log_start_time(timestamp_milliseconds, application_name, unique_id=unique_id)
+    return get_logger().user_log_start_time(timestamp_milliseconds, application_name, unique_id=unique_id)
 
 def user_log_end_time(timestamp_milliseconds, application_name, unique_id='retail-default'):
     """Convenience function for logging end time"""
-    return get_logger().log_end_time(timestamp_milliseconds, application_name, unique_id=unique_id)
+    return get_logger().user_log_end_time(timestamp_milliseconds, application_name, unique_id=unique_id)
     
 def log_custom_event(event_type, application_name, unique_id='retail-default', **kwargs):
     """Convenience function for logging custom events"""
