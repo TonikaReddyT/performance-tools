@@ -458,7 +458,6 @@ def run_pipeline_iterations(
             "down", compose_files=compose_files,
             compose_post_args="-t 30 --volumes --remove-orphans", env_vars=env_vars)
         time.sleep(15)  # Allow kernel to reclaim cgroup memory and shared memory
-        clean_up_pipeline_logs(results_dir)
 
         env_vars["PIPELINE_COUNT"] = str(num_pipelines)
         print(f"Starting num. of pipelines: {num_pipelines}")
