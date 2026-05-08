@@ -541,14 +541,24 @@ def _collect_poi_latency_from_docker_logs(app_dir: str, duration_secs: int = 30)
     detection_count = 0
     alert_count = 0
     match_count = 0
+    detection_times: list = []
+    alert_times: list = []
+
+    ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
 
     for line in result.stdout.splitlines():
         if "Face embedding found" in line:
             detection_count += 1
+            m = ts_re.match(line)
+            if m:
+                detection_times.append(m.group(1))
         elif "POI match:" in line:
             match_count += 1
         elif "Alert dispatched" in line or "Alert forwarded" in line:
             alert_count += 1
+            m = ts_re.match(line)
+            if m:
+                alert_times.append(m.group(1))
 
     stats: Dict[str, float] = {
         "poi_detections": detection_count,
@@ -561,10 +571,87 @@ def _collect_poi_latency_from_docker_logs(app_dir: str, duration_secs: int = 30)
     if match_count > 0:
         stats["alert_rate"] = alert_count / match_count
 
+    # Compute detection-to-alert latency from log timestamps
+    if detection_times and alert_times:
+        try:
+            from datetime import datetime as _dt
+            first_det = _dt.strptime(detection_times[0], "%Y-%m-%d %H:%M:%S")
+            first_alert = _dt.strptime(alert_times[0], "%Y-%m-%d %H:%M:%S")
+            latency_s = (first_alert - first_det).total_seconds()
+            if latency_s >= 0:
+                stats["log_detection_to_alert_ms"] = latency_s * 1000
+                logger.info("Log-based latency: first detection → first alert = %.0fms",
+                            latency_s * 1000)
+        except Exception:
+            pass
+
     logger.info("POI logs: %d detections, %d matches, %d alerts (in %ds window)",
                 detection_count, match_count, alert_count, duration_secs)
 
     return stats
+
+
+def _save_alert_thumbnails(results_dir: str, iteration: int = 1) -> int:
+    """Fetch alerts and their thumbnails from the POI API and save to results_dir.
+
+    Returns the number of thumbnails saved.
+    """
+    import urllib.request
+    import urllib.error
+
+    thumbs_dir = os.path.join(results_dir, f"thumbnails_iter{iteration}")
+    os.makedirs(thumbs_dir, exist_ok=True)
+    saved = 0
+
+    try:
+        req = urllib.request.Request("http://localhost:8000/api/v1/alerts")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            alerts = json.loads(resp.read().decode())
+    except Exception as e:
+        logger.warning("Failed to fetch alerts for thumbnails: %s", e)
+        return 0
+
+    if not isinstance(alerts, list) or not alerts:
+        logger.info("No alerts found — no thumbnails to save")
+        return 0
+
+    for i, alert in enumerate(alerts):
+        # Extract fields from nested alert structure
+        match_data = alert.get("match", {})
+        thumb_url = match_data.get("thumbnail_path") or alert.get("thumbnail_path") or ""
+        object_id = alert.get("object_id", "")
+        poi_id = alert.get("poi_id", "unknown")
+        camera_id = match_data.get("camera_id") or alert.get("camera_id", "unknown")
+
+        # Build the thumbnail URL
+        if thumb_url.startswith("/"):
+            thumb_url = f"http://localhost:8000{thumb_url}"
+        elif not thumb_url and object_id:
+            thumb_url = f"http://localhost:8000/api/v1/thumbnail/{object_id}"
+        else:
+            continue
+
+        try:
+            req = urllib.request.Request(thumb_url)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                img_data = resp.read()
+
+            safe_cam = re.sub(r'[^a-zA-Z0-9_-]', '_', camera_id)
+            safe_poi = re.sub(r'[^a-zA-Z0-9_-]', '_', poi_id)
+            fname = f"alert_{i:03d}_{safe_poi}_{safe_cam}.jpg"
+            fpath = os.path.join(thumbs_dir, fname)
+            with open(fpath, "wb") as f:
+                f.write(img_data)
+            saved += 1
+            logger.info("Saved thumbnail: %s", fpath)
+        except urllib.error.HTTPError as e:
+            logger.debug("Thumbnail HTTP %d for %s", e.code, thumb_url)
+        except Exception as e:
+            logger.debug("Thumbnail save failed for %s: %s", thumb_url, e)
+
+    if saved:
+        logger.info("Saved %d alert thumbnails to %s", saved, thumbs_dir)
+    return saved
 
 
 def _collect_poi_latency_from_metrics_files(results_dir: str) -> Dict[str, float]:
@@ -610,7 +697,8 @@ def _extract_poi_latency(stats: Dict[str, float], metric: str) -> float:
     Priority:
       1. vlm_application_metrics file values (most accurate — uses actual
          detection timestamp from MQTT, not log timestamp)
-      2. Returns 0 if no data available
+      2. Docker-log-based detection-to-alert latency (fallback)
+      3. Returns 0 if no data available
     """
     # Primary: vlm_application_metrics file-based values
     vlm_values = [v for k, v in stats.items()
@@ -619,6 +707,11 @@ def _extract_poi_latency(stats: Dict[str, float], metric: str) -> float:
         if metric == "max":
             return max(vlm_values)
         return mean(vlm_values)
+
+    # Fallback: docker-log-based latency
+    log_latency = stats.get("log_detection_to_alert_ms", 0.0)
+    if log_latency > 0:
+        return log_latency
 
     return 0.0
 
@@ -720,6 +813,9 @@ class POIStreamDensity:
             log_stats = _collect_poi_latency_from_docker_logs(
                 self.app_dir, self.stabilise_duration)
             file_stats = _collect_poi_latency_from_metrics_files(self.results_dir)
+
+            # Save alert thumbnails to results directory
+            _save_alert_thumbnails(self.results_dir, iteration=iteration)
 
             # Merge all stats
             stats: Dict[str, float] = {}
