@@ -3,14 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Person of Interest (POI) Stream Density Benchmark
+Suspicious Activity Detection (SAD) Stream Density Benchmark
 
 Iteratively increases the number of camera/scene pipelines until end-to-end
-POI detection-to-alert latency exceeds a configurable threshold.
-
-The POI pipeline flow measured:
-  Person detected on camera (MQTT) → face embedding extracted → FAISS match
-  → alert dispatched to alert-service
+latency exceeds a configurable threshold.
 
 Scaling is achieved by:
   1. Updating ``stream_density`` in ``zone_config.json``
@@ -18,13 +14,9 @@ Scaling is achieved by:
   3. Generating ``docker-compose.cameras.yaml`` with additional RTSP camera
      streams (``lp-cams-N``) for each new camera
   4. Restarting ``scene-import`` (imports cloned scenes into SceneScape),
-     ``lp-cams-*``, ``lp-video`` (DLStreamer), and ``poi-backend``
-  5. SceneScape core services (web, controller, broker, etc.), poi-redis,
-     poi-alert-service, and poi-ui stay running
-
-Latency is measured from ``vlm_application_metrics`` files written by the
-``vlm_metrics_logger`` package (user_log_start_time / log_end_time calls
-in poi-backend).
+     ``lp-cams-*``, ``lp-video`` (DLStreamer), and ``swlp-service``
+  5. SceneScape core services (web, controller, broker, etc.), ovms-vlm,
+     behavioral-analysis, seaweedfs, and alert-service stay running
 
 Sub-commands
 ------------
@@ -35,7 +27,7 @@ down      Tear down all services.
 
 Environment variables
 ---------------------
-TARGET_LATENCY_MS       Latency threshold in ms  (default: 2000)
+TARGET_LATENCY_MS       Latency threshold in ms  (default: 30000)
 LATENCY_METRIC          Which metric to compare: avg | max  (default: avg)
 SCENE_INCREMENT         Scenes to add per iteration  (default: 1)
 INIT_DURATION           Warm-up seconds after restart  (default: 90)
@@ -65,7 +57,8 @@ from typing import Dict, List, Optional
 
 import psutil
 
-from consolidate_multiple_run_of_metrics import get_vlm_application_latency
+# Import the latency extractor from the sibling module
+from consolidate_multiple_run_of_metrics import get_vlm_application_latency_stream_density
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -119,15 +112,16 @@ class IterationResult:
     cpu_percent: float = 0.0
     timestamp: str = ""
     # Throughput metrics
-    actual_detections: int = 0
-    alerts_generated: int = 0
-    detections_per_scene: float = 0.0
+    actual_samples: int = 0
+    expected_samples: int = 0
+    throughput_ratio: float = 1.0  # actual / expected (1.0 = healthy)
+    samples_per_scene: float = 0.0
 
 
 @dataclass
 class StreamDensityResult:
     """Aggregate result of the full stream-density run."""
-    target_latency_ms: float = 2000.0
+    target_latency_ms: float = 30000.0
     max_scenes: int = 0
     met_target: bool = False
     iterations: List[IterationResult] = field(default_factory=list)
@@ -150,6 +144,7 @@ def _read_zone_config(app_dir: str) -> dict:
 
 def _write_zone_config(app_dir: str, cfg: dict) -> None:
     p = _zone_config_path(app_dir)
+    # Keep a backup before first write
     bak = p.with_suffix(".json.bak")
     if not bak.exists():
         shutil.copy2(p, bak)
@@ -169,18 +164,26 @@ def _set_stream_density(app_dir: str, density: int) -> None:
 # ---------------------------------------------------------------------------
 
 def _compose_cmd(app_dir: str) -> str:
-    """Build the base ``docker compose`` invocation matching the POI Makefile."""
+    """Build the base ``docker compose`` invocation matching the main Makefile."""
     scenescape_dir = str(Path(app_dir) / ".." / "scenescape")
     scenescape_compose = os.path.join(scenescape_dir, "docker-compose.yaml")
-    poi_compose = os.path.join(app_dir, "docker-compose.yml")
     env_file = os.path.join(app_dir, "docker", ".env")
+
+    # Support both layouts: docker/docker-compose.yaml (SAD) and root docker-compose.yml (POI)
+    lp_compose = os.path.join(app_dir, "docker", "docker-compose.yaml")
+    if not os.path.isfile(lp_compose):
+        for candidate in ("docker-compose.yml", "docker-compose.yaml"):
+            alt = os.path.join(app_dir, candidate)
+            if os.path.isfile(alt):
+                lp_compose = alt
+                break
 
     parts = [
         "docker compose",
         f"--project-directory {shlex.quote(app_dir)}",
         f"--env-file {shlex.quote(env_file)}",
         f"-f {shlex.quote(scenescape_compose)}",
-        f"-f {shlex.quote(poi_compose)}",
+        f"-f {shlex.quote(lp_compose)}",
     ]
     # Layer in cameras override if it exists
     cameras_override = os.path.join(app_dir, "docker", "docker-compose.cameras.yaml")
@@ -189,8 +192,7 @@ def _compose_cmd(app_dir: str) -> str:
     return " ".join(parts)
 
 
-def _docker_compose(app_dir: str, action: str) -> int:
-    # Ensure the external network exists before any compose up
+def _docker_compose(app_dir: str, action: str, timeout: int = 60) -> int:
     if "up" in action:
         subprocess.run(
             "docker network create storewide-lp",
@@ -205,16 +207,14 @@ def _docker_compose(app_dir: str, action: str) -> int:
 
 
 def _run_cmd(cmd: str) -> subprocess.CompletedProcess:
+    """Run a shell command, log it, and return the result."""
     logger.debug("Running: %s", cmd)
     return subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
 
-# ---------------------------------------------------------------------------
-# Helpers – SceneScape scene cleanup via REST API
-# ---------------------------------------------------------------------------
-
 def _delete_cloned_scenes(app_dir: str, num_scenes: int) -> None:
     """Delete previously-cloned scenes from SceneScape via REST API."""
+    import re as _re
     import ssl
     import urllib.request
     import urllib.error
@@ -251,7 +251,7 @@ def _delete_cloned_scenes(app_dir: str, num_scenes: int) -> None:
 
     auth_header = {"Authorization": f"Token {token}"}
 
-    # List and delete cloned scenes (those with -N suffix)
+    # List scenes
     req = urllib.request.Request(f"{base_url}/scenes", headers=auth_header)
     try:
         with urllib.request.urlopen(req, context=ctx) as resp:
@@ -259,10 +259,11 @@ def _delete_cloned_scenes(app_dir: str, num_scenes: int) -> None:
     except Exception:
         return
 
+    # Delete cloned scenes (those with -N suffix in name)
     for scene in scenes:
         name = scene.get("name", "")
         uid = scene.get("uid", "")
-        if re.search(r'-\d+$', name):
+        if _re.search(r'-\d+$', name):
             logger.info("Deleting cloned scene: %s (%s)", name, uid)
             req = urllib.request.Request(
                 f"{base_url}/scene/{uid}",
@@ -272,7 +273,9 @@ def _delete_cloned_scenes(app_dir: str, num_scenes: int) -> None:
             except urllib.error.HTTPError as e:
                 logger.warning("  DELETE failed (%s): %s", e.code, e.reason)
 
-    # Delete orphaned cameras with -N suffix
+    # Delete orphaned cameras (cloned camera names with -N suffix)
+    # These must be cleaned up or SceneScape rejects re-import with
+    # "orphaned camera with the name '...' already exists."
     req = urllib.request.Request(f"{base_url}/cameras", headers=auth_header)
     try:
         with urllib.request.urlopen(req, context=ctx) as resp:
@@ -282,7 +285,7 @@ def _delete_cloned_scenes(app_dir: str, num_scenes: int) -> None:
     for cam in cameras:
         cam_name = cam.get("name", "")
         cam_id = cam.get("uid", cam.get("id", cam.get("sensor_id", "")))
-        if re.search(r'-\d+$', cam_name) and cam_id:
+        if _re.search(r'-\d+$', cam_name) and cam_id:
             logger.info("Deleting orphaned camera: %s (%s)", cam_name, cam_id)
             req = urllib.request.Request(
                 f"{base_url}/camera/{cam_id}",
@@ -294,49 +297,45 @@ def _delete_cloned_scenes(app_dir: str, num_scenes: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Helpers – cameras override generation
+# Helpers – cameras override generation  (REAL pipeline scaling)
 # ---------------------------------------------------------------------------
 
 def _read_base_config(app_dir: str) -> dict:
     """Read base camera/scene/video config from zone_config.json."""
     cfg = _read_zone_config(app_dir)
-    cameras = cfg.get("cameras", [])
-    if cameras:
-        camera = cameras[0].get("name", "Camera_01")
-        video = cameras[0].get("video_file", "Camera_01.mp4")
+    scenes = cfg.get("scenes", [])
+    if scenes:
+        s = scenes[0]
+        camera = (s.get("cameras") or [s.get("camera_name", "lp-camera1")])[0]
+        video = s.get("video_file", "lp-camera1.mp4")
     else:
-        camera = cfg.get("camera_name", "Camera_01")
-        video = cfg.get("video_file", "Camera_01.mp4")
+        camera = cfg.get("camera_name", "lp-camera1")
+        video = cfg.get("video_file", "lp-camera1.mp4")
     return {"camera_name": camera, "video_file": video}
 
 
 def _generate_cameras_override(app_dir: str, num_scenes: int) -> None:
     """
     Generate ``docker-compose.cameras.yaml`` that adds real RTSP camera
-    streams for each additional camera beyond the base ones.
+    streams for each additional camera beyond the base one.
 
-    For N scenes, we create lp-cams-{N+1} through lp-cams-{2*N} services,
-    each streaming the same video on a unique RTSP path.
+    For N scenes, we create lp-cams-2 through lp-cams-N services, each
+    streaming the same video on a unique RTSP path.
     """
     override_path = Path(app_dir) / "docker" / "docker-compose.cameras.yaml"
     base = _read_base_config(app_dir)
     base_camera = base["camera_name"]
     base_video = base["video_file"]
 
-    # POI already has 2 base cameras (Camera_01, Camera_02); add more
-    # starting from camera index 3 (for scenes > 1)
-    base_camera_count = 2
-
     with open(override_path, "w") as f:
-        f.write("# Auto-generated by poi_stream_density.py — do not edit\n")
+        f.write("# Auto-generated by sad_stream_density.py — do not edit\n")
         f.write(f"# Stream density: {num_scenes} scenes\n\n")
         f.write("services:\n")
 
-        # Additional RTSP camera streams
-        for i in range(1, num_scenes):
-            cam_idx = base_camera_count + i
-            cam_name = f"{base_camera}-{cam_idx}"
-            svc_name = f"lp-cams-{cam_idx}"
+        # Additional RTSP camera streams (camera 2..N)
+        for i in range(2, num_scenes + 1):
+            cam_name = f"{base_camera}-{i}"
+            svc_name = f"lp-cams-{i}"
             f.write(f"  {svc_name}:\n")
             f.write(f"    image: linuxserver/ffmpeg:version-8.0-cli\n")
             f.write(f'    command: "-nostdin -re -stream_loop -1 '
@@ -352,72 +351,69 @@ def _generate_cameras_override(app_dir: str, num_scenes: int) -> None:
             f.write(f'    restart: "no"\n')
             f.write(f"\n")
 
-        # Build dynamic MQTT camera list for poi-backend
-        all_cameras = ["Camera_01", "Camera_02"]
-        for i in range(1, num_scenes):
-            cam_idx = base_camera_count + i
-            all_cameras.append(f"{base_camera}-{cam_idx}")
-        camera_csv = ",".join(all_cameras)
-
-        # Override poi-backend to subscribe to all cameras
-        f.write(f"  poi-backend:\n")
+        # Override swlp-service to set STREAM_DENSITY
+        f.write(f"  swlp-service:\n")
         f.write(f"    environment:\n")
-        f.write(f"      RTSP_PREWARM_CAMERAS: \"{camera_csv}\"\n")
-        f.write(f"      MQTT_IMAGE_CAMERAS: \"{camera_csv}\"\n")
         f.write(f"      STREAM_DENSITY: \"{num_scenes}\"\n")
 
-    logger.info("Generated cameras override: %s  (%d scenes, %d extra cameras)",
+    logger.info("Generated cameras override: %s  (%d scenes, %d extra RTSP streams)",
                 override_path, num_scenes, max(0, num_scenes - 1))
 
 
 def _generate_dlstreamer_config(app_dir: str, num_scenes: int) -> None:
     """
-    Generate a multi-pipeline DLStreamer config for N scenes.
+    Generate a multi-pipeline DLStreamer config.json for N cameras.
 
-    Reads the base pipeline config template and replicates it for each
-    additional camera, updating the camera name in each pipeline.
+    Reads the template from ``configs/pipeline-config.json``, replaces
+    ``{{CAMERA_NAME}}`` for each camera, and writes the result to
+    SceneScape's DLStreamer config directory.
     """
     scenescape_dir = Path(app_dir) / ".." / "scenescape"
-    dlstreamer_dir = scenescape_dir / "dlstreamer-pipeline-server"
+    app_name = Path(app_dir).name
+    template_path = Path(app_dir) / "configs" / "pipeline-config.json"
+    output_path = scenescape_dir / "dlstreamer-pipeline-server" / f"{app_name}-pipeline-config.json"
 
     base = _read_base_config(app_dir)
     base_camera = base["camera_name"]
-    base_camera_count = 2
-
-    # Read existing Camera_01 pipeline config as template
-    template_path = dlstreamer_dir / f"person-of-interest-{base_camera}-pipeline-config.json"
-    if not template_path.exists():
-        logger.warning("Pipeline template not found: %s", template_path)
-        return
 
     with open(template_path) as fh:
-        template_cfg = json.load(fh)
+        template_str = fh.read()
 
-    # Generate config for each additional camera
-    for i in range(1, num_scenes):
-        cam_idx = base_camera_count + i
-        cam_name = f"{base_camera}-{cam_idx}"
-        output_path = dlstreamer_dir / f"person-of-interest-{cam_name}-pipeline-config.json"
+    # Parse the template to get the pipeline structure
+    template_cfg = json.loads(template_str.replace("{{CAMERA_NAME}}", base_camera))
+    base_pipeline = template_cfg["config"]["pipelines"][0]
 
-        # Deep-copy and substitute camera name
-        cfg_str = json.dumps(template_cfg)
-        cfg_str = cfg_str.replace(base_camera, cam_name)
-        cfg = json.loads(cfg_str)
+    pipelines = []
+    for i in range(1, num_scenes + 1):
+        cam_name = base_camera if i == 1 else f"{base_camera}-{i}"
+        # Deep-copy pipeline and update for this camera
+        pipeline_str = json.dumps(base_pipeline)
+        pipeline_str = pipeline_str.replace(base_camera, cam_name)
+        pipeline = json.loads(pipeline_str)
+        pipeline["name"] = f"reid_{cam_name}"
+        pipelines.append(pipeline)
 
-        # Update pipeline name
-        if "config" in cfg and "pipelines" in cfg["config"]:
-            for pipeline in cfg["config"]["pipelines"]:
-                pipeline["name"] = f"reid_{cam_name}"
+    output_cfg = {
+        "config": {
+            "logging": template_cfg["config"].get("logging", {
+                "C_LOG_LEVEL": "INFO",
+                "PY_LOG_LEVEL": "INFO"
+            }),
+            "pipelines": pipelines,
+        }
+    }
 
-        with open(output_path, "w") as fh:
-            json.dump(cfg, fh, indent=2)
-        logger.info("Generated pipeline config: %s", output_path)
+    with open(output_path, "w") as fh:
+        json.dump(output_cfg, fh, indent=2)
 
-    logger.info("Generated DLStreamer configs for %d total cameras", base_camera_count + num_scenes - 1)
+    logger.info("Generated DLStreamer config: %s  (%d pipelines)", output_path, len(pipelines))
 
 
 def _reinit_env(app_dir: str) -> None:
-    """Re-run init.sh to regenerate .env with updated config."""
+    """
+    Re-run init.sh to regenerate .env with the updated STREAM_DENSITY.
+    This ensures scene-import picks up the new density value.
+    """
     init_script = Path(app_dir) / ".." / "scenescape" / "scripts" / "init.sh"
     if not init_script.exists():
         logger.warning("init.sh not found at %s — skipping .env regeneration", init_script)
@@ -434,7 +430,6 @@ def _reinit_env(app_dir: str) -> None:
 
 def _wait_for_web_healthy(timeout: int = 300) -> None:
     """Block until SceneScape web container is healthy or timeout expires."""
-    # Container name depends on compose project name used at startup
     candidates = ["storewide-lp-web-1", "scenescape-web-1"]
     for attempt in range(timeout // 5):
         for name in candidates:
@@ -453,51 +448,58 @@ def _wait_for_web_healthy(timeout: int = 300) -> None:
 
 def _scale_pipeline_services(app_dir: str, num_scenes: int, wait: int = 90) -> None:
     """
-    Scale the POI video pipeline to N scenes.
+    Scale the actual video pipeline to N cameras.
 
     Steps:
-      1. Update stream_density in zone_config.json
-      2. Generate docker-compose.cameras.yaml with extra RTSP streams
-      3. Re-run init.sh to update .env
-      4. Generate per-camera DLStreamer pipeline configs
-      5. Bring up new camera services
-      6. Wait for web container healthy
-      7. Clean stale scenes, restart scene-import
-      8. Recreate lp-video (DLStreamer) and poi-backend
+      1. Generate DLStreamer config with N pipelines
+      2. Generate docker-compose.cameras.yaml with N-1 extra RTSP streams
+      3. Re-run init.sh to update .env (STREAM_DENSITY)
+      4. Restart scene-import → imports cloned scenes
+      5. Recreate lp-video → picks up new DLStreamer config
+      6. Recreate swlp-service → subscribes to new scene topics
     """
-    logger.info("Scaling POI to %d scene(s) …", num_scenes)
+    logger.info("Scaling to %d scene(s) …", num_scenes)
 
+    # Update config files
+    # Note: _reinit_env must run BEFORE _generate_dlstreamer_config because
+    # init.sh overwrites the DLStreamer config with a single-camera template.
     _set_stream_density(app_dir, num_scenes)
     _generate_cameras_override(app_dir, num_scenes)
     _reinit_env(app_dir)
     _generate_dlstreamer_config(app_dir, num_scenes)
 
-    # Bring up any new camera services
+    # Bring up any new camera services defined in the override
     logger.info("Starting new camera streams …")
     _docker_compose(app_dir, "up -d --no-recreate")
 
+    # Wait for the web container to become healthy (needed after cold start)
     _wait_for_web_healthy()
 
-    # Clean stale scene extracts in web container
-    logger.info("Cleaning stale scene-import extract dirs …")
+    # Clean up leftover extract directories inside the web container so
+    # SceneScape's ImportScene.extractZip() doesn't find stale JSON files
+    # from previous iterations (it uses exist_ok=True without clearing).
+    logger.info("Cleaning stale scene-import extract dirs in web container …")
     _run_cmd("docker exec storewide-lp-web-1 bash -c "
              "'rm -rf /workspace/media/storewide-loss-prevention-[0-9]*'")
 
+    # Also delete previously-cloned scenes from SceneScape DB via REST API
+    # so re-import succeeds (scenes with duplicate names are rejected).
     _delete_cloned_scenes(app_dir, num_scenes)
 
-    # Re-run scene-import
+    # Re-run scene-import to import cloned scenes for new cameras
     logger.info("Re-running scene-import for %d scenes …", num_scenes)
     _docker_compose(app_dir, "rm -f -s scene-import")
     _docker_compose(app_dir, "up -d scene-import")
+    # Wait for scene-import to complete (it's a one-shot container)
     time.sleep(15)
 
-    # Recreate lp-video so updated DLStreamer config is mounted
+    # Force-recreate lp-video so updated DLStreamer config is mounted
     logger.info("Recreating lp-video (DLStreamer) with new config …")
     _docker_compose(app_dir, "up -d --force-recreate lp-video")
 
-    # Recreate poi-backend to pick up new camera subscriptions
-    logger.info("Recreating poi-backend to subscribe to new cameras …")
-    _docker_compose(app_dir, "up -d --force-recreate poi-backend")
+    # Force-recreate swlp-service to pick up new env / scene subscriptions
+    logger.info("Recreating swlp-service …")
+    _docker_compose(app_dir, "up -d --force-recreate swlp-service")
 
     logger.info("Waiting %ds for services to initialise …", wait)
     time.sleep(wait)
@@ -509,110 +511,134 @@ def _clean_cameras_override(app_dir: str) -> None:
         override_path.unlink()
         logger.info("Removed %s", override_path)
 
-    # Also remove generated pipeline configs for extra cameras
-    scenescape_dir = Path(app_dir) / ".." / "scenescape"
-    dlstreamer_dir = scenescape_dir / "dlstreamer-pipeline-server"
-    for cfg_file in dlstreamer_dir.glob("person-of-interest-*-[0-9]*-pipeline-config.json"):
-        cfg_file.unlink()
-        logger.info("Removed extra pipeline config: %s", cfg_file)
-
 
 # ---------------------------------------------------------------------------
-# Latency collection — POI-specific
+# Latency collection
 # ---------------------------------------------------------------------------
 
-def _collect_poi_latency_from_docker_logs(app_dir: str, duration_secs: int = 30) -> Dict[str, float]:
+def _collect_latency_from_docker_logs(app_dir: str, duration_secs: int = 30) -> Dict[str, float]:
     """
-    Extract end-to-end POI latency from poi-backend docker logs.
+    Extract end-to-end latency from swlp-service docker logs.
 
-    Measures the time between face detection (``Face embedding found``) and
-    alert dispatch (``Alert dispatched``) by correlating log timestamps.
+    Measures the time between "Published BA request" (last_frame_ts) and the
+    corresponding "BA queue: status update" (timestamp) for the same person_id
+    + region_id pair.
 
-    Also counts total detections and alerts for throughput tracking.
+    Returns a dict with latency statistics.
     """
-    container = "poi-backend"
+    container = "storewide-lp-swlp-service-1"
     since_arg = f"--since={duration_secs + 30}s"
     cmd = f"docker logs {container} {since_arg} 2>&1"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.warning("Failed to get poi-backend logs: %s", result.stderr[:200])
+        logger.warning("Failed to get docker logs: %s", result.stderr[:200])
         return {}
 
-    detection_count = 0
-    alert_count = 0
-    match_count = 0
+    # Parse structured JSON log lines
+    ba_requests: Dict[str, datetime] = {}  # key: person_id+region_id -> last_frame_ts
+    latencies: list = []
 
     for line in result.stdout.splitlines():
-        if "Face embedding found" in line:
-            detection_count += 1
-        elif "POI match:" in line:
-            match_count += 1
-        elif "Alert dispatched" in line or "Alert forwarded" in line:
-            alert_count += 1
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
 
-    stats: Dict[str, float] = {
-        "poi_detections": detection_count,
-        "poi_matches": match_count,
-        "poi_alerts": alert_count,
-    }
+        event = entry.get("event", "")
+        person_id = entry.get("person_id", "")
+        region_id = entry.get("region_id", "")
+        key = f"{person_id}:{region_id}"
 
-    if detection_count > 0:
-        stats["match_rate"] = match_count / detection_count
-    if match_count > 0:
-        stats["alert_rate"] = alert_count / match_count
+        if event == "Published BA request":
+            last_frame_ts = entry.get("last_frame_ts", "")
+            if last_frame_ts:
+                try:
+                    ts = datetime.fromisoformat(last_frame_ts.replace("Z", "+00:00"))
+                    ba_requests[key] = ts
+                except (ValueError, TypeError):
+                    pass
 
-    logger.info("POI logs: %d detections, %d matches, %d alerts (in %ds window)",
-                detection_count, match_count, alert_count, duration_secs)
+        elif event == "BA queue: status update" and key in ba_requests:
+            ts_str = entry.get("timestamp", "")
+            if ts_str:
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    start = ba_requests.pop(key)
+                    delta_ms = (ts - start).total_seconds() * 1000
+                    if delta_ms > 0:
+                        latencies.append(delta_ms)
+                except (ValueError, TypeError):
+                    pass
+
+    stats: Dict[str, float] = {}
+    if latencies:
+        stats["e2e_latency_count"] = len(latencies)
+        stats["e2e_latency_avg_ms"] = mean(latencies)
+        stats["e2e_latency_median_ms"] = median(latencies)
+        stats["e2e_latency_min_ms"] = min(latencies)
+        stats["e2e_latency_max_ms"] = max(latencies)
+        # Per-scene breakdown: count unique scene/region keys
+        unique_scenes = set()
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("event") == "Published BA request":
+                scene = entry.get("scene_name", entry.get("scene_id", ""))
+                if scene:
+                    unique_scenes.add(scene)
+        stats["active_scenes"] = max(len(unique_scenes), 1)
+        logger.info("Collected %d BA round-trip latency samples  (avg=%.0fms, active_scenes=%d)",
+                     len(latencies), stats["e2e_latency_avg_ms"], stats["active_scenes"])
+    else:
+        logger.warning("No BA round-trip samples found in docker logs")
+
+    # Also try the vlm_application_metrics files as a secondary source
+    file_stats = _collect_latency_from_files(os.path.join(app_dir, "results"))
+    stats.update(file_stats)
 
     return stats
 
 
-def _collect_poi_latency_from_metrics_files(results_dir: str) -> Dict[str, float]:
+def _collect_latency_from_files(results_dir: str) -> Dict[str, float]:
     """
-    Extract POI detection-to-alert latency from vlm_application_metrics files.
-
-    These files are written by the vlm_metrics_logger package via
-    user_log_start_time (detection) and log_end_time (alert dispatch)
-    calls in the poi-backend.
+    Use ``get_vlm_application_latency_stream_density`` to extract latency
+    from the most recent vlm_application_metrics file, using only the
+    last 20 completed start/end pairs to reflect current-iteration
+    performance.
     """
     all_stats: Dict[str, float] = {}
     search_dirs = [results_dir, "/tmp"]
-
     for d in search_dirs:
         if not os.path.isdir(d):
             continue
-
-        # Find vlm_application_metrics files
-        pattern = os.path.join(d, "vlm_application_metrics_*.txt")
-        files = sorted(glob.glob(pattern), key=os.path.getmtime)
-        if not files:
-            continue
-
-        # Use the most recent file
-        latest = files[-1]
         try:
-            stats = get_vlm_application_latency(latest)
+            stats = get_vlm_application_latency_stream_density(d, last_n_pairs=20)
             if stats:
-                for key, avg_ms in stats.items():
-                    # Extract a clean key name
-                    all_stats[f"vlm_{key}"] = avg_ms
-                logger.info("VLM metrics file latency (%s): %s", latest, stats)
+                # Convert to a consistent format
+                for app_id, avg_ms in stats.items():
+                    all_stats[f"vlm_{app_id}_avg_ms"] = avg_ms
+                logger.info("VLM file-based latency: %s", stats)
         except Exception as e:
-            logger.warning("Failed to parse VLM metrics in %s: %s", d, e)
-
+            logger.warning("Failed to parse vlm metrics in %s: %s", d, e)
     return all_stats
 
 
-def _extract_poi_latency(stats: Dict[str, float], metric: str) -> float:
+def _extract_latency_value(stats: Dict[str, float], metric: str) -> float:
     """
-    Extract a single representative POI latency value from collected stats.
+    Given the latency stats dict, return a single representative latency (ms).
 
-    Priority:
-      1. vlm_application_metrics file values (most accurate — uses actual
-         detection timestamp from MQTT, not log timestamp)
-      2. Returns 0 if no data available
+    Prefers ``get_vlm_application_latency_stream_density`` file-based values,
+    falls back to docker-log E2E latency.
     """
-    # Primary: vlm_application_metrics file-based values
+    # Primary: vlm_application_metrics file values
     vlm_values = [v for k, v in stats.items()
                   if k.startswith("vlm_") and isinstance(v, (int, float)) and v > 0]
     if vlm_values:
@@ -620,11 +646,16 @@ def _extract_poi_latency(stats: Dict[str, float], metric: str) -> float:
             return max(vlm_values)
         return mean(vlm_values)
 
+    # Fallback: docker-log based E2E latency
+    if metric == "max" and "e2e_latency_max_ms" in stats:
+        return stats["e2e_latency_max_ms"]
+    if "e2e_latency_avg_ms" in stats:
+        return stats["e2e_latency_avg_ms"]
+
     return 0.0
 
 
 def _clean_metrics(results_dir: str) -> None:
-    """Remove stale metrics files before each measurement iteration."""
     patterns = [
         "vlm_application_metrics*.txt",
         "vlm_performance_metrics*.txt",
@@ -639,25 +670,26 @@ def _clean_metrics(results_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# POI Stream Density Runner
+# Stream Density Runner
 # ---------------------------------------------------------------------------
 
-class POIStreamDensity:
+class SADStreamDensity:
     """
     Iteratively increases the number of camera pipelines until end-to-end
-    POI detection-to-alert latency exceeds *target_latency_ms*.
+    latency exceeds *target_latency_ms*.
 
     What gets scaled at each iteration:
-      - RTSP camera streams (lp-cams-N)    → real video feed
-      - DLStreamer pipelines (lp-video)     → inference per camera
-      - SceneScape scenes (scene-import)    → scene clones in SceneScape DB
-      - poi-backend camera subscriptions    → MQTT + RTSP for new cameras
+      - RTSP camera streams  (lp-cams-N)  → real video feed
+      - DLStreamer pipelines (lp-video)    → inference per camera
+      - SceneScape scenes    (scene-import) → scene clones in SceneScape DB
+      - swlp-service subscriptions         → MQTT topics for each scene
 
     What stays running untouched:
-      - SceneScape core (web, controller, broker, ntpserv, pgserver, vdms)
-      - poi-redis          (metadata store)
-      - poi-alert-service  (alert fan-out)
-      - poi-ui             (React frontend)
+      - SceneScape core  (web, controller, broker, ntpserv, pgserver, vdms)
+      - ovms-vlm          (model server — stateless)
+      - behavioral-analysis  (receives per-request work — stateless)
+      - seaweedfs          (object storage)
+      - alert-service
       - mediaserver        (RTSP relay)
     """
 
@@ -675,6 +707,7 @@ class POIStreamDensity:
         max_iterations: int,
         single_run: bool = False,
         single_run_scenes: int = 1,
+        min_throughput_ratio: float = 0.5,
     ):
         self.app_dir = os.path.abspath(app_dir)
         self.target_latency_ms = target_latency_ms
@@ -686,10 +719,13 @@ class POIStreamDensity:
         self.max_iterations = max_iterations
         self.single_run = single_run
         self.single_run_scenes = single_run_scenes
+        self.min_throughput_ratio = min_throughput_ratio
         os.makedirs(self.results_dir, exist_ok=True)
 
+    # ---- public API -------------------------------------------------------
+
     def run(self) -> StreamDensityResult:
-        """Execute the POI stream-density loop."""
+        """Execute the stream-density loop."""
         self._print_header()
         result = StreamDensityResult(target_latency_ms=self.target_latency_ms)
 
@@ -709,24 +745,25 @@ class POIStreamDensity:
             # Clean old metrics before each measurement
             _clean_metrics(self.results_dir)
 
-            # Scale to desired scene count
+            # Scale to desired scene count (real pipeline scaling)
             _scale_pipeline_services(self.app_dir, num_scenes, wait=self.init_duration)
 
             # Wait for pipeline to stabilise and collect data
             logger.info("Collecting data for %ds …", self.stabilise_duration)
             time.sleep(self.stabilise_duration)
 
-            # Collect latency from metrics files + docker logs
-            log_stats = _collect_poi_latency_from_docker_logs(
-                self.app_dir, self.stabilise_duration)
-            file_stats = _collect_poi_latency_from_metrics_files(self.results_dir)
+            # Collect latency from docker logs (primary) + metrics files (secondary)
+            stats = _collect_latency_from_docker_logs(self.app_dir, self.stabilise_duration)
+            latency = _extract_latency_value(stats, self.latency_metric)
 
-            # Merge all stats
-            stats: Dict[str, float] = {}
-            stats.update(log_stats)
-            stats.update(file_stats)
-
-            latency = _extract_poi_latency(stats, self.latency_metric)
+            # Throughput: compare actual samples to expected
+            actual_samples = int(stats.get("e2e_latency_count", 0))
+            # Baseline: ~12 samples per scene per 30s collection window
+            if not hasattr(self, '_baseline_rate'):
+                self._baseline_rate = max(actual_samples, 1)
+            expected_samples = num_scenes * self._baseline_rate
+            throughput_ratio = actual_samples / expected_samples if expected_samples > 0 else 1.0
+            samples_per_scene = actual_samples / num_scenes if num_scenes > 0 else 0
 
             it_result = IterationResult(
                 num_scenes=num_scenes,
@@ -735,17 +772,15 @@ class POIStreamDensity:
                 memory_percent=psutil.virtual_memory().percent,
                 cpu_percent=psutil.cpu_percent(interval=1),
                 timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                actual_detections=int(stats.get("poi_detections", 0)),
-                alerts_generated=int(stats.get("poi_alerts", 0)),
-                detections_per_scene=(
-                    int(stats.get("poi_detections", 0)) / num_scenes
-                    if num_scenes > 0 else 0
-                ),
+                actual_samples=actual_samples,
+                expected_samples=expected_samples,
+                throughput_ratio=throughput_ratio,
+                samples_per_scene=samples_per_scene,
             )
 
             self._print_iteration(it_result)
 
-            # Pass/fail based on latency threshold
+            # Pass/fail: based on latency only
             latency_ok = latency > 0 and latency <= self.target_latency_ms
 
             if latency == 0:
@@ -755,7 +790,7 @@ class POIStreamDensity:
             elif latency_ok:
                 it_result.passed = True
                 best = it_result
-                print(f"  ✓ PASSED  (latency={latency:.0f}ms ≤ {self.target_latency_ms:.0f}ms)")
+                print(f"  ✓ PASSED  (latency={latency:.0f}ms, throughput={throughput_ratio:.0%})")
             else:
                 it_result.passed = False
                 print(f"  ✗ FAILED  (latency {latency:.0f}ms > {self.target_latency_ms:.0f}ms)")
@@ -773,6 +808,8 @@ class POIStreamDensity:
         self._print_summary(result)
         return result
 
+    # ---- internal ---------------------------------------------------------
+
     def _memory_safe(self) -> bool:
         mem = psutil.virtual_memory()
         if mem.percent > self.MEMORY_SAFETY_PERCENT:
@@ -781,9 +818,11 @@ class POIStreamDensity:
             return False
         return True
 
+    # ---- output -----------------------------------------------------------
+
     def _print_header(self) -> None:
         print("=" * 70)
-        print("POI Stream Density – Detection-to-Alert Latency Scaling")
+        print("SAD Stream Density – Scene-Based Latency Scaling")
         print("=" * 70)
         print(f"  Target Latency:    {self.target_latency_ms:.0f}ms")
         print(f"  Latency Metric:    {self.latency_metric}")
@@ -795,23 +834,19 @@ class POIStreamDensity:
         print("=" * 70)
 
     def _print_iteration(self, it: IterationResult) -> None:
-        print(f"\n  Scenes:      {it.num_scenes}")
-        print(f"  Latency:     {it.latency_ms:.0f}ms")
-        print(f"  Detections:  {it.actual_detections} "
-              f"({it.detections_per_scene:.1f}/scene)")
-        print(f"  Alerts:      {it.alerts_generated}")
-        print(f"  Memory:      {it.memory_percent:.1f}%")
-        print(f"  CPU:         {it.cpu_percent:.1f}%")
+        print(f"\n  Scenes:   {it.num_scenes}")
+        print(f"  Latency:  {it.latency_ms:.0f}ms")
+        print(f"  Throughput: {it.actual_samples}/{it.expected_samples} samples "
+              f"({it.throughput_ratio:.0%}, {it.samples_per_scene:.1f}/scene)")
+        print(f"  Memory:   {it.memory_percent:.1f}%")
+        print(f"  CPU:      {it.cpu_percent:.1f}%")
         if it.latency_details:
             for k, v in it.latency_details.items():
-                if isinstance(v, float):
-                    print(f"    {k}: {v:.2f}")
-                else:
-                    print(f"    {k}: {v}")
+                print(f"    {k}: {v:.2f}")
 
     def _print_summary(self, result: StreamDensityResult) -> None:
         print("\n" + "=" * 70)
-        print("POI STREAM DENSITY RESULTS")
+        print("STREAM DENSITY RESULTS")
         print("=" * 70)
         print(f"  Target Latency:  {result.target_latency_ms:.0f}ms")
         print(f"  Max Scenes:      {result.max_scenes}")
@@ -820,13 +855,12 @@ class POIStreamDensity:
             print(f"  Best Latency:    {result.best_iteration.latency_ms:.0f}ms "
                   f"@ {result.best_iteration.num_scenes} scene(s)")
         print()
-        print(f"{'Scenes':<10}{'Latency':<12}{'Detections':<14}"
-              f"{'Alerts':<10}{'Mem %':<10}{'CPU %':<10}{'Status':<10}")
-        print("-" * 76)
+        print(f"{'Scenes':<10}{'Latency':<12}{'Throughput':<14}{'Mem %':<10}{'CPU %':<10}{'Status':<10}")
+        print("-" * 66)
         for it in result.iterations:
             status = "✓ PASS" if it.passed else "✗ FAIL"
-            print(f"{it.num_scenes:<10}{it.latency_ms:<12.0f}"
-                  f"{it.actual_detections:<14}{it.alerts_generated:<10}"
+            tp = f"{it.throughput_ratio:.0%}"
+            print(f"{it.num_scenes:<10}{it.latency_ms:<12.0f}{tp:<14}"
                   f"{it.memory_percent:<10.1f}{it.cpu_percent:<10.1f}{status}")
         print("=" * 70)
 
@@ -834,7 +868,7 @@ class POIStreamDensity:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # JSON
-        json_path = os.path.join(self.results_dir, f"poi_stream_density_{ts}.json")
+        json_path = os.path.join(self.results_dir, f"sad_stream_density_{ts}.json")
         data = {
             "target_latency_ms": result.target_latency_ms,
             "max_scenes": result.max_scenes,
@@ -847,9 +881,10 @@ class POIStreamDensity:
                     "memory_percent": round(it.memory_percent, 1),
                     "cpu_percent": round(it.cpu_percent, 1),
                     "timestamp": it.timestamp,
-                    "actual_detections": it.actual_detections,
-                    "alerts_generated": it.alerts_generated,
-                    "detections_per_scene": round(it.detections_per_scene, 1),
+                    "throughput_ratio": round(it.throughput_ratio, 3),
+                    "actual_samples": it.actual_samples,
+                    "expected_samples": it.expected_samples,
+                    "samples_per_scene": round(it.samples_per_scene, 1),
                     "latency_details": {
                         k: round(v, 2) if isinstance(v, float) else v
                         for k, v in it.latency_details.items()
@@ -868,15 +903,15 @@ class POIStreamDensity:
         print(f"\nJSON results: {json_path}")
 
         # CSV
-        csv_path = os.path.join(self.results_dir, f"poi_stream_density_{ts}.csv")
+        csv_path = os.path.join(self.results_dir, f"sad_stream_density_{ts}.csv")
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["scenes", "latency_ms", "detections", "alerts",
-                         "detections_per_scene", "passed", "memory_pct", "cpu_pct"])
+            w.writerow(["scenes", "latency_ms", "throughput_ratio", "actual_samples",
+                        "expected_samples", "samples_per_scene", "passed", "memory_pct", "cpu_pct"])
             for it in result.iterations:
                 w.writerow([it.num_scenes, f"{it.latency_ms:.0f}",
-                            it.actual_detections, it.alerts_generated,
-                            f"{it.detections_per_scene:.1f}",
+                            f"{it.throughput_ratio:.3f}", it.actual_samples,
+                            it.expected_samples, f"{it.samples_per_scene:.1f}",
                             it.passed, f"{it.memory_percent:.1f}",
                             f"{it.cpu_percent:.1f}"])
         print(f"CSV results:  {csv_path}")
@@ -887,8 +922,9 @@ class POIStreamDensity:
 # ---------------------------------------------------------------------------
 
 def cmd_run(args) -> None:
-    tester = POIStreamDensity(
-        app_dir=args.app_dir,
+    app_dir = args.app_dir
+    tester = SADStreamDensity(
+        app_dir=app_dir,
         target_latency_ms=args.target_latency_ms,
         latency_metric=args.latency_metric,
         scene_increment=args.scene_increment,
@@ -898,22 +934,25 @@ def cmd_run(args) -> None:
         max_iterations=args.max_iterations,
         single_run=args.single_run,
         single_run_scenes=args.scenes,
+        min_throughput_ratio=args.min_throughput_ratio,
     )
     result = tester.run()
     sys.exit(0 if result.met_target else 1)
 
 
 def cmd_generate(args) -> None:
+    app_dir = args.app_dir
     num = args.scenes
-    _set_stream_density(args.app_dir, num)
-    _generate_dlstreamer_config(args.app_dir, num)
-    _generate_cameras_override(args.app_dir, num)
-    _reinit_env(args.app_dir)
+    _set_stream_density(app_dir, num)
+    _generate_dlstreamer_config(app_dir, num)
+    _generate_cameras_override(app_dir, num)
+    _reinit_env(app_dir)
     print(f"Generated overrides for {num} scene(s).  Run 'make demo' to start.")
 
 
 def cmd_clean(args) -> None:
     app_dir = args.app_dir
+    # Restore zone_config.json from backup
     bak = _zone_config_path(app_dir).with_suffix(".json.bak")
     if bak.exists():
         shutil.copy2(bak, _zone_config_path(app_dir))
@@ -921,19 +960,23 @@ def cmd_clean(args) -> None:
         logger.info("Restored zone_config.json from backup")
     else:
         _set_stream_density(app_dir, 1)
+    # Restore single-pipeline DLStreamer config
     _generate_dlstreamer_config(app_dir, 1)
+    # Remove cameras override
     _clean_cameras_override(app_dir)
+    # Re-run init to reset .env
     _reinit_env(app_dir)
     print("Cleaned up – stream_density reset to 1.")
 
 
 def cmd_down(args) -> None:
-    _docker_compose(args.app_dir, "down -t 30 --volumes --remove-orphans")
+    app_dir = args.app_dir
+    _docker_compose(app_dir, "down -t 30 --volumes --remove-orphans")
     cmd_clean(args)
 
 
 def main() -> None:
-    target_latency = _env_float("TARGET_LATENCY_MS", 2000)
+    target_latency = _env_float("TARGET_LATENCY_MS", 30000)
     latency_metric = _env_str("LATENCY_METRIC", "avg")
     scene_increment = _env_int("SCENE_INCREMENT", 1)
     init_duration = _env_int("INIT_DURATION", 90)
@@ -942,14 +985,14 @@ def main() -> None:
     max_iterations = _env_int("MAX_ITERATIONS", 50)
 
     parser = argparse.ArgumentParser(
-        description="POI Stream Density Benchmark",
+        description="SAD Stream Density Benchmark",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # --- run ---
-    p_run = sub.add_parser("run", help="Run POI stream-density loop")
-    p_run.add_argument("app_dir", help="Path to person-of-interest/")
+    p_run = sub.add_parser("run", help="Run stream-density loop")
+    p_run.add_argument("app_dir", help="Path to suspicious-activity-detection/")
     p_run.add_argument("--target_latency_ms", type=float, default=target_latency)
     p_run.add_argument("--latency_metric", choices=["avg", "max"], default=latency_metric)
     p_run.add_argument("--scene_increment", type=int, default=scene_increment)
@@ -957,6 +1000,9 @@ def main() -> None:
     p_run.add_argument("--stabilise_duration", type=int, default=stabilise_duration)
     p_run.add_argument("--results_dir", default=results_dir)
     p_run.add_argument("--max_iterations", type=int, default=max_iterations)
+    p_run.add_argument("--min_throughput_ratio", type=float,
+                       default=float(os.environ.get("BENCHMARK_MIN_THROUGHPUT_RATIO", "0.5")),
+                       help="Min ratio of actual/expected BA samples (0-1)")
     p_run.add_argument("--single_run", action="store_true",
                        help="Run once with --scenes scenes (benchmark mode)")
     p_run.add_argument("--scenes", type=int, default=1,

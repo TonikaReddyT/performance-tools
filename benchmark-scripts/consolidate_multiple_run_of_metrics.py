@@ -100,6 +100,69 @@ def get_vlm_application_latency(log_file_path):
     
     return statistics
 
+
+def get_vlm_application_latency_stream_density(results_dir, last_n_pairs=20):
+    """Extract per-application average latency from the most recent
+    vlm_application_metrics file in *results_dir*, using only the last
+    *last_n_pairs* completed start/end pairs to reflect current-iteration
+    performance.
+
+    Args:
+        results_dir: Directory to search for vlm_application_metrics*.txt.
+        last_n_pairs: Number of most-recent completed pairs to use per app.
+
+    Returns:
+        dict mapping ``app_id`` → ``avg_latency_ms`` (float), or empty dict
+        if no metrics files are found.
+    """
+    metrics_files = sorted(
+        fnmatch.filter(
+            [str(p) for p in pathlib.Path(results_dir).rglob("vlm_application_metrics*.txt")],
+            "*vlm_application_metrics*",
+        ),
+        key=os.path.getmtime,
+    )
+    if not metrics_files:
+        return {}
+
+    log_file_path = metrics_files[-1]
+
+    timing_data = defaultdict(list)
+    with open(log_file_path, "r") as fh:
+        for line in fh:
+            line = line.strip()
+            if "application=" not in line or "timestamp_ms=" not in line:
+                continue
+            pattern = r'(\w+)=((?:[^\s=]+(?:\s(?!\w+=)[^\s=]+)*)?)'
+            matches = re.findall(pattern, line)
+            data = dict(matches)
+            if not data:
+                continue
+            app_name = data.get("application", "")
+            id_value = data.get("id", "")
+            event = data.get("event", "")
+            timestamp_ms = data.get("timestamp_ms", "")
+            if app_name and id_value and event in ("start", "end") and timestamp_ms:
+                timing_data[f"{app_name}_{id_value}"].append(
+                    {"event": event, "timestamp_ms": int(timestamp_ms)}
+                )
+
+    result = {}
+    for app_id, events in timing_data.items():
+        events.sort(key=lambda x: x["timestamp_ms"])
+        durations = []
+        start_stack = []
+        for ev in events:
+            if ev["event"] == "start":
+                start_stack.append(ev["timestamp_ms"])
+            elif ev["event"] == "end" and start_stack:
+                durations.append(ev["timestamp_ms"] - start_stack.pop())
+        if durations:
+            tail = durations[-last_n_pairs:]
+            result[app_id] = sum(tail) / len(tail)
+
+    return result
+
 class KPIExtractor(ABC):
     @abstractmethod
     def extract_data(self, log_file_path):
