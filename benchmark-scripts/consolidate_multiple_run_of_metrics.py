@@ -738,6 +738,43 @@ class PipelineLatencyExtractor(KPIExtractor):
 
     def return_blank(self):
         return {"LATENCY": "NA"}
+
+class StreamDensityExtractor(KPIExtractor):
+    """Extract stream density benchmark results from JSON files."""
+    def extract_data(self, log_file_path):
+        try:
+            with open(log_file_path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+        results = {}
+        results["Stream Density Target Latency (ms)"] = data.get("target_latency_ms", "NA")
+        results["Stream Density Max Scenes"] = data.get("max_scenes", "NA")
+        results["Stream Density Met Target"] = data.get("met_target", "NA")
+
+        if data.get("best_iteration"):
+            best = data["best_iteration"]
+            results["Stream Density Best Latency (ms)"] = best.get("latency_ms", "NA")
+            results["Stream Density Best Scenes"] = best.get("num_scenes", "NA")
+
+        iterations = data.get("iterations", [])
+        for it in iterations:
+            n = it.get("num_scenes", "?")
+            prefix = f"Stream Density {n} Scene(s)"
+            results[f"{prefix} Latency (ms)"] = it.get("latency_ms", "NA")
+            results[f"{prefix} Throughput Ratio"] = it.get("throughput_ratio", "NA")
+            results[f"{prefix} Actual Samples"] = it.get("actual_samples", "NA")
+            results[f"{prefix} Expected Samples"] = it.get("expected_samples", "NA")
+            results[f"{prefix} Samples/Scene"] = it.get("samples_per_scene", "NA")
+            results[f"{prefix} Passed"] = it.get("passed", "NA")
+            results[f"{prefix} Memory %"] = it.get("memory_percent", "NA")
+            results[f"{prefix} CPU %"] = it.get("cpu_percent", "NA")
+
+        return results
+
+    def return_blank(self):
+        return {"Stream Density Max Scenes": "-"}
         
 class PCMExtractor(KPIExtractor):
     #overriding abstract method
@@ -812,7 +849,8 @@ KPIExtractor_OPTION = {"meta_summary.txt":MetaExtractor,
                        r"(?:^xpum).*\.json$": XPUMUsageExtractor,
                        r"^qmassa.*parsed.*\.json$": QMASSAGPUUsageExtractor,
                        r"^vlm_application_metrics.*\.txt$": VLMAppMetricsExtractor,
-                       r"^vlm_performance_metrics.*\.txt$": VLMPerformanceMetricsExtractor}
+                       r"^vlm_performance_metrics.*\.txt$": VLMPerformanceMetricsExtractor,
+                       r"^swlp_stream_density.*\.json$": StreamDensityExtractor}
 
 def add_parser():
     parser = argparse.ArgumentParser(description='Consolidate data')
