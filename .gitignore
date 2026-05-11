@@ -19,3 +19,4 @@ efficientnet-b0/
 model_server/
 .coverage
 venv/
+*.egg-info/
