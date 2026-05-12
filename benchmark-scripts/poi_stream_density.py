@@ -589,6 +589,70 @@ def _collect_poi_latency_from_docker_logs(app_dir: str, duration_secs: int = 30)
     return stats
 
 
+def _collect_poi_e2e_latency_from_alerts() -> Dict[str, float]:
+    """Compute real end-to-end latency from POI alerts API.
+
+    Each alert contains:
+      - ``timestamp``: when the person was detected by the camera (MQTT msg)
+      - ``dispatched_at``: when the alert was actually dispatched
+
+    Returns dict with ``poi_e2e_latency_avg_ms``, ``poi_e2e_latency_max_ms``,
+    ``poi_e2e_latency_min_ms``, and ``poi_e2e_alert_count``.
+    """
+    import urllib.request
+    import urllib.error
+
+    try:
+        req = urllib.request.Request("http://localhost:8000/api/v1/alerts")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            alerts = json.loads(resp.read().decode())
+    except Exception as e:
+        logger.warning("Failed to fetch alerts for E2E latency: %s", e)
+        return {}
+
+    if not isinstance(alerts, list) or not alerts:
+        return {}
+
+    from datetime import datetime as _dt
+
+    latencies_ms: list[float] = []
+    for alert in alerts:
+        ts_str = alert.get("timestamp", "")
+        dispatched_str = alert.get("dispatched_at", "")
+        if not ts_str or not dispatched_str:
+            continue
+        try:
+            # Parse ISO timestamps — handle both Z suffix and +00:00
+            ts_str = ts_str.replace("Z", "+00:00")
+            dispatched_str = dispatched_str.replace("Z", "+00:00")
+            ts = _dt.fromisoformat(ts_str)
+            dispatched = _dt.fromisoformat(dispatched_str)
+            delta_ms = (dispatched - ts).total_seconds() * 1000
+            if delta_ms >= 0:
+                latencies_ms.append(delta_ms)
+        except (ValueError, TypeError):
+            continue
+
+    if not latencies_ms:
+        return {}
+
+    stats: Dict[str, float] = {
+        "poi_e2e_latency_avg_ms": sum(latencies_ms) / len(latencies_ms),
+        "poi_e2e_latency_max_ms": max(latencies_ms),
+        "poi_e2e_latency_min_ms": min(latencies_ms),
+        "poi_e2e_alert_count": len(latencies_ms),
+    }
+    logger.info(
+        "E2E latency (MQTT detection → alert dispatch): "
+        "avg=%.0fms, min=%.0fms, max=%.0fms (%d alerts)",
+        stats["poi_e2e_latency_avg_ms"],
+        stats["poi_e2e_latency_min_ms"],
+        stats["poi_e2e_latency_max_ms"],
+        len(latencies_ms),
+    )
+    return stats
+
+
 def _save_alert_thumbnails(results_dir: str, iteration: int = 1) -> int:
     """Fetch alerts and their thumbnails from the POI API and save to results_dir.
 
@@ -693,16 +757,25 @@ def _extract_poi_latency(stats: Dict[str, float], metric: str) -> float:
     Extract a single representative POI latency value from collected stats.
 
     Priority:
-      1. vlm_application_metrics file values (most accurate — uses actual
-         detection timestamp from MQTT, not log timestamp)
-      2. Returns 0 if no data available
+      1. Real E2E latency from alerts API (MQTT detection → alert dispatch,
+         millisecond precision)
+      2. vlm_application_metrics file values (SAD pipeline)
+      3. Returns 0 if no data available
 
     Note: Docker-log-based ``log_detection_to_alert_ms`` is excluded because
     log timestamps have only second-level precision and the first-match-to-
     first-alert gap includes dedup delay (60 s TTL), making it unreliable
     as a per-event latency metric.
     """
-    # Primary: vlm_application_metrics file-based values
+    # Primary: real E2E latency from alerts API
+    e2e_avg = stats.get("poi_e2e_latency_avg_ms", 0.0)
+    e2e_max = stats.get("poi_e2e_latency_max_ms", 0.0)
+    if e2e_avg > 0:
+        if metric == "max":
+            return e2e_max
+        return e2e_avg
+
+    # Fallback: vlm_application_metrics file-based values
     vlm_values = [v for k, v in stats.items()
                   if k.startswith("vlm_") and isinstance(v, (int, float)) and v > 0]
     if vlm_values:
@@ -810,6 +883,7 @@ class POIStreamDensity:
             log_stats = _collect_poi_latency_from_docker_logs(
                 self.app_dir, self.stabilise_duration)
             file_stats = _collect_poi_latency_from_metrics_files(self.results_dir)
+            e2e_stats = _collect_poi_e2e_latency_from_alerts()
 
             # Save alert thumbnails to results directory
             _save_alert_thumbnails(self.results_dir, iteration=iteration)
@@ -818,6 +892,7 @@ class POIStreamDensity:
             stats: Dict[str, float] = {}
             stats.update(log_stats)
             stats.update(file_stats)
+            stats.update(e2e_stats)
 
             latency = _extract_poi_latency(stats, self.latency_metric)
 
