@@ -878,7 +878,7 @@ if __name__ == '__main__':
                     fileFound = True
                     extractor = KPIExtractor_OPTION.get(kpiExtractor)()
                     kpi_dict = extractor.extract_data(
-                        os.path.join(root_directory, file))
+                        os.path.join(dirpath, file))
                     if kpi_dict:
                         # Collect max median from each file for aggregate statistics
                         for key, value in kpi_dict.items():
