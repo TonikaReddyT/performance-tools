@@ -850,7 +850,7 @@ KPIExtractor_OPTION = {"meta_summary.txt":MetaExtractor,
                        r"^qmassa.*parsed.*\.json$": QMASSAGPUUsageExtractor,
                        r"^vlm_application_metrics.*\.txt$": VLMAppMetricsExtractor,
                        r"^vlm_performance_metrics.*\.txt$": VLMPerformanceMetricsExtractor,
-                       r"^(?:swlp|poi)_stream_density.*\.json$": StreamDensityExtractor}
+                       r"^swlp_stream_density.*\.json$": StreamDensityExtractor}
 
 def add_parser():
     parser = argparse.ArgumentParser(description='Consolidate data')
