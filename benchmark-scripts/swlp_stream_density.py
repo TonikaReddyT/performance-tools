@@ -351,24 +351,29 @@ def _generate_dlstreamer_config(app_dir: str, num_scenes: int) -> None:
     """
     Generate a multi-pipeline DLStreamer config.json for N cameras.
 
-    Reads the template from ``configs/pipeline-config.json``, replaces
-    ``{{CAMERA_NAME}}`` for each camera, and writes the result to
-    SceneScape's DLStreamer config directory.
+    Reads the **rendered** config (output of init.sh, with all pipeline
+    variables like DECODE, QUEUE_OPTIONS etc. already resolved) and
+    duplicates the base pipeline entry for each additional camera.
+
+    IMPORTANT: This must run AFTER _reinit_env() so that init.sh has
+    already produced a fully-resolved single-camera config.
     """
     scenescape_dir = Path(app_dir) / ".." / "scenescape"
     app_name = Path(app_dir).name
-    template_path = Path(app_dir) / "configs" / "pipeline-config.json"
     output_path = scenescape_dir / "dlstreamer-pipeline-server" / f"{app_name}-pipeline-config.json"
 
     base = _read_base_config(app_dir)
     base_camera = base["camera_name"]
 
-    with open(template_path) as fh:
-        template_str = fh.read()
+    # Read the rendered config that init.sh just produced (all {{VAR}} resolved)
+    if not output_path.exists():
+        logger.error("Rendered DLStreamer config not found at %s — did init.sh run?", output_path)
+        return
 
-    # Parse the template to get the pipeline structure
-    template_cfg = json.loads(template_str.replace("{{CAMERA_NAME}}", base_camera))
-    base_pipeline = template_cfg["config"]["pipelines"][0]
+    with open(output_path) as fh:
+        rendered_cfg = json.load(fh)
+
+    base_pipeline = rendered_cfg["config"]["pipelines"][0]
 
     pipelines = []
     for i in range(1, num_scenes + 1):
@@ -382,7 +387,7 @@ def _generate_dlstreamer_config(app_dir: str, num_scenes: int) -> None:
 
     output_cfg = {
         "config": {
-            "logging": template_cfg["config"].get("logging", {
+            "logging": rendered_cfg["config"].get("logging", {
                 "C_LOG_LEVEL": "INFO",
                 "PY_LOG_LEVEL": "INFO"
             }),
@@ -590,6 +595,12 @@ def _collect_latency_from_files(results_dir: str) -> Dict[str, float]:
     """
     all_stats: Dict[str, float] = {}
     search_dirs = [results_dir, "/tmp"]
+    # Also search immediate subdirectories (e.g. results/swlp/, results/ba/)
+    if os.path.isdir(results_dir):
+        for entry in os.listdir(results_dir):
+            sub = os.path.join(results_dir, entry)
+            if os.path.isdir(sub):
+                search_dirs.append(sub)
     for d in search_dirs:
         if not os.path.isdir(d):
             continue
@@ -630,17 +641,49 @@ def _extract_latency_value(stats: Dict[str, float], metric: str) -> float:
 
 
 def _clean_metrics(results_dir: str) -> None:
+    """
+    Archive previous-run metrics files into a timestamped subdirectory
+    so they are retained for later analysis, then remove any leftover
+    copies from /tmp.
+    """
     patterns = [
         "vlm_application_metrics*.txt",
         "vlm_performance_metrics*.txt",
     ]
-    for d in [results_dir, "/tmp"]:
+
+    # Archive files from results_dir (and its subdirectories) instead of deleting
+    archive_dirs = [results_dir]
+    if os.path.isdir(results_dir):
+        for entry in os.listdir(results_dir):
+            sub = os.path.join(results_dir, entry)
+            if os.path.isdir(sub) and not entry.startswith("archived_"):
+                archive_dirs.append(sub)
+
+    archived_count = 0
+    for d in archive_dirs:
         for pat in patterns:
             for f in glob.glob(os.path.join(d, pat)):
+                archive_subdir = os.path.join(
+                    d, f"archived_{time.strftime('%Y%m%d_%H%M%S')}")
                 try:
-                    os.remove(f)
+                    os.makedirs(archive_subdir, exist_ok=True)
+                    shutil.move(f, os.path.join(archive_subdir, os.path.basename(f)))
+                    archived_count += 1
+                except PermissionError:
+                    logger.warning("Cannot archive %s (permission denied) — skipping", f)
                 except OSError:
                     pass
+
+    if archived_count:
+        logger.info("Archived %d metrics file(s) from previous run", archived_count)
+
+    # Only truly delete from /tmp (transient, no need to retain)
+    for pat in patterns:
+        for f in glob.glob(os.path.join("/tmp", pat)):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -934,9 +977,9 @@ def cmd_generate(args) -> None:
     app_dir = args.app_dir
     num = args.scenes
     _set_stream_density(app_dir, num)
-    _generate_dlstreamer_config(app_dir, num)
     _generate_cameras_override(app_dir, num)
     _reinit_env(app_dir)
+    _generate_dlstreamer_config(app_dir, num)
     print(f"Generated overrides for {num} scene(s).  Run 'make demo' to start.")
 
 
@@ -950,12 +993,12 @@ def cmd_clean(args) -> None:
         logger.info("Restored zone_config.json from backup")
     else:
         _set_stream_density(app_dir, 1)
-    # Restore single-pipeline DLStreamer config
-    _generate_dlstreamer_config(app_dir, 1)
     # Remove cameras override
     _clean_cameras_override(app_dir)
-    # Re-run init to reset .env
+    # Re-run init to render single-pipeline config
     _reinit_env(app_dir)
+    # Restore single-pipeline DLStreamer config (reads rendered output)
+    _generate_dlstreamer_config(app_dir, 1)
     print("Cleaned up – stream_density reset to 1.")
 
 
