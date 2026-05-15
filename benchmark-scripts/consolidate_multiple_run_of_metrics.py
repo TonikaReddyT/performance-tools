@@ -102,76 +102,66 @@ def get_vlm_application_latency(log_file_path):
 
 
 def get_vlm_application_latency_stream_density(results_dir, last_n_pairs=20):
-    """
-    Extract VLM application latency from the most recent log file in a
-    directory, using only the last N completed start/end pairs per
-    application to reflect current-iteration performance.
-
-    Reads the full file to correctly pair start/end events, then only
-    averages the most recent `last_n_pairs` completed durations.
+    """Extract per-application average latency from the most recent
+    vlm_application_metrics file in *results_dir*, using only the last
+    *last_n_pairs* completed start/end pairs to reflect current-iteration
+    performance.
 
     Args:
-        results_dir (str): Directory containing VLM application metrics logs.
-        last_n_pairs (int): Number of most recent completed start/end pairs
-                            to use for averaging. Default 20.
+        results_dir: Directory to search for vlm_application_metrics*.txt.
+        last_n_pairs: Number of most-recent completed pairs to use per app.
 
     Returns:
-        dict: {app_id_combo: avg_latency_ms} for the most recent completed
-              pairs. Returns empty dict if no valid pairs found.
+        dict mapping ``app_id`` → ``avg_latency_ms`` (float), or empty dict
+        if no metrics files are found.
     """
-    import glob
-
-    # Glob for matching VLM application metrics files
-    matching_files = glob.glob(os.path.join(results_dir, 'vlm_application_metrics*.txt'))
-    if not matching_files:
-        print(f"WARN: No vlm_application_metrics files found in {results_dir}")
+    metrics_files = sorted(
+        fnmatch.filter(
+            [str(p) for p in pathlib.Path(results_dir).rglob("vlm_application_metrics*.txt")],
+            "*vlm_application_metrics*",
+        ),
+        key=os.path.getmtime,
+    )
+    if not metrics_files:
         return {}
 
-    # Pick the latest file by modification time
-    latest_file = max(matching_files, key=os.path.getmtime)
+    log_file_path = metrics_files[-1]
 
-    # Read the full file to correctly pair start/end events
     timing_data = defaultdict(list)
-    with open(latest_file, 'r') as file:
-        for line in file:
+    with open(log_file_path, "r") as fh:
+        for line in fh:
             line = line.strip()
-            if 'application=' in line and 'timestamp_ms=' in line:
-                pattern = r'(\w+)=((?:[^\s=]+(?:\s(?!\w+=)[^\s=]+)*)?)'
-                matches = re.findall(pattern, line)
-                data = dict(matches)
-                if data:
-                    app_name = data.get('application')
-                    id_value = data.get('id')
-                    event = data.get('event')
-                    timestamp_ms = data.get('timestamp_ms')
+            if "application=" not in line or "timestamp_ms=" not in line:
+                continue
+            pattern = r'(\w+)=((?:[^\s=]+(?:\s(?!\w+=)[^\s=]+)*)?)'
+            matches = re.findall(pattern, line)
+            data = dict(matches)
+            if not data:
+                continue
+            app_name = data.get("application", "")
+            id_value = data.get("id", "")
+            event = data.get("event", "")
+            timestamp_ms = data.get("timestamp_ms", "")
+            if app_name and id_value and event in ("start", "end") and timestamp_ms:
+                timing_data[f"{app_name}_{id_value}"].append(
+                    {"event": event, "timestamp_ms": int(timestamp_ms)}
+                )
 
-                    if app_name and id_value and event in ['start', 'end'] and timestamp_ms:
-                        timing_data[f"{app_name}_{id_value}"].append({
-                            'event': event,
-                            'timestamp_ms': int(timestamp_ms)
-                        })
-
-    # Calculate all durations, then take only the last N pairs
-    latency_results = {}
-    for app_id_combo, events in timing_data.items():
-        sorted_events = sorted(events, key=lambda x: x['timestamp_ms'])
-        start_times = []
+    result = {}
+    for app_id, events in timing_data.items():
+        events.sort(key=lambda x: x["timestamp_ms"])
         durations = []
+        start_stack = []
+        for ev in events:
+            if ev["event"] == "start":
+                start_stack.append(ev["timestamp_ms"])
+            elif ev["event"] == "end" and start_stack:
+                durations.append(ev["timestamp_ms"] - start_stack.pop())
+        if durations:
+            tail = durations[-last_n_pairs:]
+            result[app_id] = sum(tail) / len(tail)
 
-        for event in sorted_events:
-            if event['event'] == 'start':
-                start_times.append(event['timestamp_ms'])
-            elif event['event'] == 'end' and start_times:
-                start_time = start_times.pop()
-                durations.append(event['timestamp_ms'] - start_time)
-
-        # Use only the most recent N completed pairs
-        recent_durations = durations[-last_n_pairs:]
-        if recent_durations:
-            latency_results[app_id_combo] = sum(recent_durations) / len(recent_durations)
-
-    return latency_results
-
+    return result
 
 class KPIExtractor(ABC):
     @abstractmethod
@@ -860,7 +850,7 @@ KPIExtractor_OPTION = {"meta_summary.txt":MetaExtractor,
                        r"^qmassa.*parsed.*\.json$": QMASSAGPUUsageExtractor,
                        r"^vlm_application_metrics.*\.txt$": VLMAppMetricsExtractor,
                        r"^vlm_performance_metrics.*\.txt$": VLMPerformanceMetricsExtractor,
-                       r"^swlp_stream_density.*\.json$": StreamDensityExtractor}
+                       r"^(?:swlp|poi)_stream_density.*\.json$": StreamDensityExtractor}
 
 def add_parser():
     parser = argparse.ArgumentParser(description='Consolidate data')
